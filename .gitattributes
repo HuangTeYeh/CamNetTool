@@ -1,0 +1,2 @@
+# 保持檔案原樣：.ps1 / .cs 是 UTF-8 with BOM + CRLF，.bat 是 ASCII + CRLF，不讓 Git 轉換換行
+* -text

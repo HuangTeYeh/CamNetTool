@@ -1,0 +1,13 @@
+# 執行後自動產生（每台電腦自己的資料，不放進版本控制）
+CamNetToolLog/
+CamNetToolData/
+Diag/
+*.config.json
+unsaved_*.csv
+
+# 發佈用的 zip
+dist/
+
+# Windows
+desktop.ini
+Thumbs.db
