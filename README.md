@@ -32,5 +32,6 @@ powershell -ExecutionPolicy Bypass -STA -File tests\CoreTests.ps1
 
 | 版本 | 日期 | 內容 |
 |---|---|---|
+| 2.0.2 | 2026-11-26 | 相機 ping 改為從所選網卡的 IP 送出（IcmpSendEcho2Ex，等同 `ping -S`）；網卡沒有 IPv4 時不改從別張網卡送；來源改變記事件 22 |
 | 2.0.1 | 2026-11-25 | 修正 AQtion 接收丟棄計數（低 32 位元自己變動時被誤算成大量丟棄）；最佳化設定新增「非 GigE 驅動」檢查（可修正、可復原）與 Flow Control 顯示 |
 | 2.0.0 | 2026-11-23 | 以 NicMonitor 1.1.0 為基礎：相機監控（GVCP 唯讀）、自動偵測相機 IP、診斷快照、封包擷取分析、最佳化設定、版本與更新 |

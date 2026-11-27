@@ -75,6 +75,16 @@ try {
     Check '廣播位址 169.254.192.4/16' ((Get-BroadcastAddress '169.254.192.4' 16) -eq '169.254.255.255')
     Check '同網段判斷' ((Test-SameSubnet '169.254.23.146' '169.254.192.4' 16) -and -not (Test-SameSubnet '192.168.1.2' '169.254.192.4' 16))
 
+    # ---- 指定來源 IP 的 ping（IcmpSendEcho2Ex，等同 ping -S）----
+    $sp = New-Object SourcePing
+    try {
+        $r1 = $sp.Send('127.0.0.1', '127.0.0.1', 500)
+        Check 'SourcePing：127.0.0.1 → 127.0.0.1 成功' ($r1.Ok -and $r1.StatusText -eq 'Success' -and $r1.ReplyFrom -eq '127.0.0.1')
+        $r2 = $sp.Send('10.250.250.250', '127.0.0.1', 500)
+        Check 'SourcePing：來源 IP 不是這台電腦的 → 失敗，不會改從別的 IP 送' (-not $r2.Ok -and $r2.Status -ne 0) "$($r2.Status) $($r2.StatusText)"
+    } finally { $sp.Dispose() }
+    Check 'SourcePing：狀態名稱與 .NET IPStatus 相同（舊記錄的 Fail:TimedOut 等格式不變）' (([SourcePing]::StatusName(11010) -eq 'TimedOut') -and ([SourcePing]::StatusName(11003) -eq 'DestinationHostUnreachable') -and ([SourcePing]::StatusName(11050) -eq 'GeneralFailure'))
+
     # ---- 設定檔：沿用 NicMonitor 的設定 ----
     $script:AppDir = $work
     $nm = [ordered]@{ AdapterGuid = '{11111111-2222-3333-4444-555555555555}'; AdapterName = '小FOV'; CameraIp = '169.254.1.2'; IntervalSec = 7; LogDir = 'X:\nope'; BeepOnAlarm = $false }
@@ -141,6 +151,29 @@ try {
     Check "camstatus 每一列都是 $n 欄（包含無回應的列）" ($badCols -eq 0 -and $lines.Count -eq $i + 1) "$($lines.Count - 1) 列"
     $nm17 = 'Time,LinkStatus,LinkSpeed,RxMBps,RxDiscardDelta,RxErrorDelta,TxDiscardDelta,TxErrorDelta,CameraPingMs,CpuPercent,AcpiTempC,RxDiscardDeltaDiv2p32,NicMacTempC,NicPhyTempC,AqRxPathReset,AqTxPathReset,AqTxWatchdog'
     Check 'status 保留 NicMonitor 1.1.0 的 17 欄，最後加 RxDiscardDeltaRaw' ($script:StatusHeader -eq "$nm17,RxDiscardDeltaRaw")
+
+    # ---- ping 來源 IP 的快取與重查（以假的 Get-LocalIpForCamera 代替真的網卡）----
+    $origLocal = ${function:Get-LocalIpForCamera}
+    try {
+        $script:fakeLocal = '169.254.1.10'; $script:fakeCalls = 0
+        ${function:Get-LocalIpForCamera} = { param($Guid, $CameraIp) $script:fakeCalls++; return $script:fakeLocal }
+        $keepS = $script:S
+        $PS0 = New-MonitorState '{x}' 'test' '169.254.1.2'
+        $script:S = $PS0                     # Add-MonitorEvent 寫到 $script:S.Events
+        $tp = Get-Date '2026-11-26 09:00:00'
+        $src1 = Update-PingSource $PS0 $tp
+        $src2 = Update-PingSource $PS0 $tp.AddSeconds(5)
+        Check 'ping 來源：第一次查到後快取，不會每次都查網卡' ($src1 -eq '169.254.1.10' -and $src2 -eq '169.254.1.10' -and $script:fakeCalls -eq 1)
+        $script:fakeLocal = '169.254.1.11'; $PS0.LastPingOk = $false
+        $src3 = Update-PingSource $PS0 $tp.AddSeconds(20)
+        $src4 = Update-PingSource $PS0 $tp.AddSeconds(40)
+        Check 'ping 來源：ping 失敗時每 30 秒重查一次，IP 改變就換來源' ($src3 -eq '169.254.1.10' -and $src4 -eq '169.254.1.11' -and $script:fakeCalls -eq 2)
+        $PS0.LastPingOk = $true; $script:fakeLocal = $null; $PS0.CameraIp = '169.254.9.9'
+        $src5 = Update-PingSource $PS0 $tp.AddSeconds(41)
+        Check 'ping 來源：相機 IP 改變立刻重查；網卡沒有 IPv4 → 沒有來源（不改從別張網卡送）' ($src5 -eq '' -and $script:fakeCalls -eq 3)
+        $ev22 = @($PS0.Events | Where-Object { $_.EventId -eq 22 })
+        Check 'ping 來源改變 → 事件 22（2 次）' ($ev22.Count -eq 2 -and $ev22[0].Message -match '網卡沒有 IPv4') (($ev22 | ForEach-Object { $_.Message }) -join ' | ')
+    } finally { ${function:Get-LocalIpForCamera} = $origLocal; $script:S = $keepS }
 
     # ---- 套用前後比較 ----
     $at = Get-Date '2026-11-20 12:00:00'
@@ -259,6 +292,18 @@ try {
             $smp = Read-CameraSample
             Check '實機：一次讀完所有監控暫存器' ($smp.Status -eq 'Ok' -and $smp.V.ContainsKey('Temp') -and $smp.T.ContainsKey('XferSel')) ("{0} 個位址，{1} ms，溫度 {2:0.0} °C" -f $script:Cam.ReadAddrs.Count, $smp.Ms, $smp.V.Temp)
             Disconnect-Camera
+            # ping 從相機網卡送出要通；硬從別張網卡的 IP 送出要不通（證明來源真的有綁定，不是路由表幫忙選）
+            $camSrc = Get-LocalIpForCamera ([string]$nic.InterfaceGuid) $f.Ip
+            $other = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceIndex -ne $nic.ifIndex -and $_.AddressState -eq 'Preferred' -and $_.IPAddress -notmatch '^127\.' } | Select-Object -First 1
+            $sp = New-Object SourcePing
+            try {
+                $rc = $sp.Send($camSrc, $f.Ip, 500)
+                Check '實機：ping 從相機網卡的 IP 送出' $rc.Ok ("{0} → {1}，{2} ms" -f $camSrc, $f.Ip, $rc.RoundtripMs)
+                if ($other) {
+                    $ro = $sp.Send([string]$other.IPAddress, $f.Ip, 500)
+                    Check '實機：從別張網卡的 IP 送出 → 不通（來源有綁定）' (-not $ro.Ok) ("{0}（{1}）→ {2}：{3}" -f $other.IPAddress, $other.InterfaceAlias, $f.Ip, $ro.StatusText)
+                } else { Write-Host 'SKIP  沒有其他網卡可以對照' }
+            } finally { $sp.Dispose() }
         }
         $nb = Get-NonGigEBindings $nic.Name
         $fcp = Get-AdvProp @(Get-NetAdapterAdvancedProperty -Name $nic.Name -AllProperties -ErrorAction SilentlyContinue) @('*FlowControl', 'FlowControl')

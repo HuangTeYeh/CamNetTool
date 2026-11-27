@@ -1,5 +1,6 @@
 ﻿// CamNetTool 原生元件（由 CamNetTool.ps1 以 Add-Type 編譯；只能用 C# 5 語法）
 //   NicMonNative : GetIfEntry2、CPU 時間、工作列閃爍（沿用 NicMonitor 1.1.0）
+//   SourcePing   : 指定來源 IP 的 ICMP ping（IcmpSendEcho2Ex，等同 ping -S）
 //   GvcpClient   : GigE Vision 控制通道（UDP 3956）READREG / READMEM / WRITEREG / DISCOVERY
 //   GenApiModel  : 解析相機 GenICam XML，把 feature 追到暫存器位址並計算公式
 //   GenFormula   : GenICam 公式（SwissKnife / Converter）計算器
@@ -82,6 +83,84 @@ public static class NicMonNative {
 
     [DllImport("psapi.dll")] private static extern bool EmptyWorkingSet(IntPtr hProcess);
     public static void TrimWorkingSet() { try { EmptyWorkingSet(System.Diagnostics.Process.GetCurrentProcess().Handle); } catch { } }
+}
+
+// ---------------------------------------------------------------------------
+//  ICMP ping：指定從哪個本機 IP 送出（等同 ping -S <來源> <目的>）
+//  .NET 的 System.Net.NetworkInformation.Ping 不能指定來源，會由路由表決定從哪張網卡出去；
+//  多張網卡、網段重疊（例如都是 169.254.x.x）時，ping 可能從別張網卡送出，結果不可信。
+//  IcmpSendEcho2Ex 綁定來源 IP 後，Windows 只會從擁有這個 IP 的網卡送出（strong host 送出模式）。
+// ---------------------------------------------------------------------------
+public class SourcePingReply {
+    public bool Ok;
+    public int Status;              // IP_STATUS（0 = 成功，11010 = 逾時…）或 Win32 錯誤碼
+    public long RoundtripMs;
+    public string StatusText;       // 與 IPStatus 相同的名稱（Success、TimedOut、DestinationHostUnreachable…）
+    public string ReplyFrom;        // 回應封包的來源位址
+    public string Source, Destination;
+}
+
+public class SourcePing : IDisposable {
+    [DllImport("iphlpapi.dll", SetLastError = true)] private static extern IntPtr IcmpCreateFile();
+    [DllImport("iphlpapi.dll", SetLastError = true)] private static extern bool IcmpCloseHandle(IntPtr handle);
+    [DllImport("iphlpapi.dll", SetLastError = true)]
+    private static extern uint IcmpSendEcho2Ex(IntPtr handle, IntPtr evt, IntPtr apcRoutine, IntPtr apcContext,
+        uint sourceAddress, uint destinationAddress, byte[] requestData, ushort requestSize, IntPtr requestOptions,
+        byte[] replyBuffer, uint replySize, uint timeout);
+
+    private IntPtr handle;
+    private readonly byte[] data;
+    private readonly byte[] reply;
+
+    public SourcePing() {
+        handle = IcmpCreateFile();
+        if (handle == IntPtr.Zero || handle == new IntPtr(-1)) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+        data = new byte[32];                                   // 與 ping.exe 相同：32 位元組 abcdefghijklmnopqrstuvwabcdefghi
+        for (int i = 0; i < data.Length; i++) data[i] = (byte)('a' + i % 23);
+        reply = new byte[256 + data.Length];                   // ICMP_ECHO_REPLY + 資料 + 8 位元組 ICMP 錯誤訊息，留足空間
+    }
+
+    public void Dispose() {
+        if (handle != IntPtr.Zero) { IcmpCloseHandle(handle); handle = IntPtr.Zero; }
+    }
+
+    static uint V4(string ip) {
+        IPAddress a = IPAddress.Parse(ip);
+        if (a.AddressFamily != AddressFamily.InterNetwork) throw new ArgumentException("只支援 IPv4：" + ip);
+        return BitConverter.ToUInt32(a.GetAddressBytes(), 0);   // 記憶體中為網路位元組順序，正是 IPAddr 要的格式
+    }
+
+    public static string StatusName(int status) {
+        if (status == 0) return "Success";
+        if (Enum.IsDefined(typeof(System.Net.NetworkInformation.IPStatus), status))
+            return ((System.Net.NetworkInformation.IPStatus)status).ToString();
+        if (status == 11050) return "GeneralFailure";          // IP_GENERAL_FAILURE（IPStatus 沒有定義這個值）
+        if (status >= 11000 && status < 12000) return "IpStatus" + status;
+        return "Error: " + new System.ComponentModel.Win32Exception(status).Message;
+    }
+
+    // 同步送出一個 echo request，最多等 timeoutMs
+    public SourcePingReply Send(string sourceIp, string destinationIp, int timeoutMs) {
+        if (handle == IntPtr.Zero) throw new ObjectDisposedException("SourcePing");
+        SourcePingReply r = new SourcePingReply();
+        r.Source = sourceIp; r.Destination = destinationIp;
+        uint src = V4(sourceIp), dst = V4(destinationIp);
+        Array.Clear(reply, 0, reply.Length);
+        uint n = IcmpSendEcho2Ex(handle, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, src, dst,
+            data, (ushort)data.Length, IntPtr.Zero, reply, (uint)reply.Length, (uint)Math.Max(1, timeoutMs));
+        if (n == 0) {
+            r.Status = Marshal.GetLastWin32Error();
+            if (r.Status == 0) r.Status = 11050;               // IP_GENERAL_FAILURE
+        } else {
+            // ICMP_ECHO_REPLY 前三個欄位（32/64 位元版本相同）：Address、Status、RoundTripTime
+            r.ReplyFrom = new IPAddress(BitConverter.GetBytes(BitConverter.ToUInt32(reply, 0))).ToString();
+            r.Status = (int)BitConverter.ToUInt32(reply, 4);
+            r.RoundtripMs = BitConverter.ToUInt32(reply, 8);
+        }
+        r.Ok = r.Status == 0;
+        r.StatusText = StatusName(r.Status);
+        return r;
+    }
 }
 
 // ---------------------------------------------------------------------------

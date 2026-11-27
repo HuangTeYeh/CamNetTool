@@ -270,10 +270,21 @@ $client = $null
 try {
     if (-not $ctx.LocalIp) { throw '沒有電腦端 IP，無法探測' }
     if ($ctx.CamIp) {
-        $ping = New-Object System.Net.NetworkInformation.Ping
-        $okCnt = 0
-        for ($i = 0; $i -lt 4; $i++) { try { if (($ping.Send($ctx.CamIp, 500)).Status -eq 'Success') { $okCnt++ } } catch { } }
-        Log "  Ping $($ctx.CamIp)：4 次成功 $okCnt 次"
+        # 從相機網卡的 IP 送出（等同 ping -S），不讓路由表改從別張網卡送
+        $pingSrc = Get-LocalIpForCamera $ctx.Guid $ctx.CamIp
+        $ping = New-Object SourcePing
+        try {
+            $okCnt = 0; $fails = @(); $rtt = @()
+            for ($i = 0; $i -lt 4; $i++) {
+                try {
+                    $r = $ping.Send($pingSrc, $ctx.CamIp, 500)
+                    if ($r.Ok) { $okCnt++; $rtt += $r.RoundtripMs } else { $fails += $r.StatusText }
+                } catch { $fails += $_.Exception.Message }
+            }
+            $rttText = if ($rtt.Count) { "，往返 {0}～{1} ms" -f ($rtt | Measure-Object -Minimum).Minimum, ($rtt | Measure-Object -Maximum).Maximum } else { '' }
+            $failText = if ($fails.Count) { '，失敗：' + (($fails | Select-Object -Unique) -join '、') } else { '' }
+            Log "  Ping $($ctx.CamIp)（從 $pingSrc 送出）：4 次成功 $okCnt 次$rttText$failText"
+        } finally { $ping.Dispose() }
     }
     $found = @(Find-GigECameras $ctx.Guid 1500)
     $gv.Discovery = $found.Count

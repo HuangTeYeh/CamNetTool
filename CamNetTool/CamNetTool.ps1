@@ -17,7 +17,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $script:AppName    = 'CamNetTool'
-$script:AppVersion = '2.0.1'
+$script:AppVersion = '2.0.2'
 $script:ScriptPath = $MyInvocation.MyCommand.Path
 $script:AppDir     = Split-Path -Parent $script:ScriptPath
 $script:LibDir     = Join-Path $script:AppDir 'lib'
@@ -377,6 +377,23 @@ function Get-AqDiagnostics([string]$Description) {
     return @{ MacC = $mac; PhyC = $phy; RxReset = [long]$d.rxPathResetCount; TxReset = [long]$d.txPathResetCount; TxWatchdog = [long]$d.txWatchdogEventCount }
 }
 
+# 相機 ping 的來源 IP：所選網卡上與相機同網段的 IPv4（等同 ping -S）。
+# 查一次就快取；相機 IP 改變時立刻重查，沒有來源或 ping 失敗時每 30 秒重查一次（網卡 IP 可能改變）。
+function Update-PingSource($S, [datetime]$Now) {
+    $stale = (-not $S.PingSrc -or $S.LastPingOk -eq $false) -and ($Now - $S.PingSrcAt).TotalSeconds -ge 30
+    if ($S.PingSrcFor -eq $S.CameraIp -and -not $stale) { return $S.PingSrc }
+    $S.PingSrcAt = $Now
+    $new = ''
+    try { $new = [string](Get-LocalIpForCamera $S.Guid $S.CameraIp) } catch { }
+    if ($S.PingSrcFor -and $new -ne $S.PingSrc) {
+        $from = if ($S.PingSrc) { $S.PingSrc } else { '（無）' }
+        $to = if ($new) { $new } else { '（網卡沒有 IPv4）' }
+        Add-MonitorEvent -Time $Now -Source $script:AppName -EventId 22 -Severity Info -Message "相機 ping 來源改變：$from → $to（相機 $($S.CameraIp)）"
+    }
+    $S.PingSrc = $new; $S.PingSrcFor = $S.CameraIp
+    return $new
+}
+
 function Get-MonitorSample {
     $S = $script:S
     $smp = @{
@@ -406,15 +423,21 @@ function Get-MonitorSample {
     } catch { $smp.Errors += "網卡：$($_.Exception.Message)" }
 
     if ($S.CameraIp) {
-        try {
-            $r = $script:Pinger.Send($S.CameraIp, $script:PingTimeoutMs)
-            $smp.PingStatus = [string]$r.Status
-            $smp.PingOk = ($r.Status -eq [System.Net.NetworkInformation.IPStatus]::Success)
-            if ($smp.PingOk) { $smp.PingMs = [long]$r.RoundtripTime }
-        } catch {
+        $src = Update-PingSource $S (Get-Date)
+        if (-not $src) {
             $smp.PingOk = $false
-            $inner = $_.Exception; while ($inner.InnerException) { $inner = $inner.InnerException }
-            $smp.PingStatus = 'Error: ' + $inner.Message
+            $smp.PingStatus = 'NoSourceIp'          # 所選網卡沒有 IPv4：不送 ping，也不改從別張網卡送
+        } else {
+            try {
+                $r = $script:Pinger.Send($src, $S.CameraIp, $script:PingTimeoutMs)
+                $smp.PingStatus = $r.StatusText
+                $smp.PingOk = $r.Ok
+                if ($smp.PingOk) { $smp.PingMs = [long]$r.RoundtripMs }
+            } catch {
+                $smp.PingOk = $false
+                $inner = $_.Exception; while ($inner.InnerException) { $inner = $inner.InnerException }
+                $smp.PingStatus = 'Error: ' + $inner.Message
+            }
         }
     }
 
@@ -621,6 +644,7 @@ function New-MonitorState([string]$Guid, [string]$AdapterName, [string]$CameraIp
         Guid = $Guid; AdapterName = $AdapterName; CameraIp = $CameraIp
         LastLink = $null; LastUpSpeed = 0L; LinkDownSince = $null
         LastPingOk = $null; PingDownSince = $null
+        PingSrc = ''; PingSrcFor = ''; PingSrcAt = [datetime]::MinValue
         PrevStats = $null; PrevTs = 0L
         Cum = @{ RxDisc = 0L; RxErr = 0L; TxDisc = 0L; TxErr = 0L; RxDiscRaw = 0.0 }
         DiscardPacked = $false
@@ -764,7 +788,7 @@ function Start-Monitoring {
     $script:S = New-MonitorState $cfg.AdapterGuid $cfg.AdapterName ($cfg.CameraIp.Trim())
     $S = $script:S
     $script:CpuPrev = $null
-    $script:Pinger = New-Object System.Net.NetworkInformation.Ping
+    $script:Pinger = New-Object SourcePing
     [void](Initialize-LogDir)
     try {
         $na = Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { [string]$_.InterfaceGuid -eq $S.Guid } | Select-Object -First 1
@@ -777,9 +801,13 @@ function Start-Monitoring {
     $S.Cam = New-CameraState
     $camOk = $false
     try { $camOk = Start-CameraMonitoring } catch { $S.CamNote = "相機連線失敗：$($_.Exception.Message)" }
-    $ipText = if ($S.CameraIp) { $S.CameraIp } else { '（找不到，不 ping）' }
     $mode = if ($cfg.CameraIpAuto) { '自動偵測' } else { '手動' }
-    Add-MonitorEvent -Time $S.StartTime -Source $script:AppName -EventId 1 -Severity Info -Message ("監控開始（網卡：{0}，相機 IP：{1}（{2}），取樣間隔 {3} 秒，{4} {5}）" -f $S.AdapterName, $ipText, $mode, $cfg.IntervalSec, $script:AppName, $script:AppVersion)
+    if ($S.CameraIp) {
+        $src = Update-PingSource $S $S.StartTime
+        $srcText = if ($src) { "，ping 從 $src 送出" } else { '，網卡沒有 IPv4，ping 暫停' }
+        $ipText = "$($S.CameraIp)（$mode$srcText）"
+    } else { $ipText = "（找不到，不 ping）（$mode）" }
+    Add-MonitorEvent -Time $S.StartTime -Source $script:AppName -EventId 1 -Severity Info -Message ("監控開始（網卡：{0}，相機 IP：{1}，取樣間隔 {2} 秒，{3} {4}）" -f $S.AdapterName, $ipText, $cfg.IntervalSec, $script:AppName, $script:AppVersion)
     if (-not $camOk -and $S.CamNote) {
         Add-MonitorEvent -Time (Get-Date) -Source 'Camera' -EventId 102 -Severity Warning -Message "相機監控暫時無法開始：$($S.CamNote)。之後每分鐘自動重試" -NoAlarm
     }
@@ -1238,8 +1266,11 @@ function Update-StatusView {
 
     $U.Adapter.Text = $S.AdapterName
     if (-not $S.CameraIp) { $U.Ping.Text = '（沒有相機 IP）'; $U.Ping.ForeColor = $cGray }
-    elseif ($smp.PingOk) { $U.Ping.Text = "$($smp.PingMs) ms（$($S.CameraIp)）"; $U.Ping.ForeColor = $cText }
-    else { $U.Ping.Text = "失敗：$($smp.PingStatus)（$($S.CameraIp)）"; $U.Ping.ForeColor = $cRed }
+    else {
+        $route = if ($S.PingSrc) { "$($S.PingSrc) → $($S.CameraIp)" } else { "網卡沒有 IPv4 → $($S.CameraIp)" }
+        if ($smp.PingOk) { $U.Ping.Text = "$($smp.PingMs) ms（$route）"; $U.Ping.ForeColor = $cText }
+        else { $U.Ping.Text = "失敗：$($smp.PingStatus)（$route）"; $U.Ping.ForeColor = $cRed }
+    }
     $U.Rx.Text = if ($null -ne $S.Last.RxMBps) { '{0:N2} MB/s' -f $S.Last.RxMBps } else { '—（下一次取樣起計算）' }
     $fmt = { param($a, $b) if ($null -eq $a) { "— / 累計 {0:N0}" -f $b } else { "本次 {0:N0} / 累計 {1:N0}" -f $a, $b } }
     $U.RxDisc.Text = (& $fmt $d.RxDisc $S.Cum.RxDisc) + $(if ($S.DiscardPacked) { '（已修正高 32 位元）' } else { '' })

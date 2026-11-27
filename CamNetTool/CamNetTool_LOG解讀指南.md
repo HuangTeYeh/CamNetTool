@@ -1,4 +1,4 @@
-# CamNetTool 2.0.1 記錄檔解讀指南（給 AI 與分析人員）
+# CamNetTool 2.0.2 記錄檔解讀指南（給 AI 與分析人員）
 
 本文件說明 CamNetTool 做了什麼、產生哪些檔案、每個欄位與事件的意義，以及如何從記錄判斷問題。讀者不需要看程式碼，就能正確解讀 CamNetTool 產出的記錄。
 
@@ -24,7 +24,7 @@
 每個週期（設定 `IntervalSec`，常見為 5 或 10 秒）依序做：
 
 1. **讀網卡計數器**：連線狀態、速度、接收位元組、丟棄、錯誤（Windows API `GetIfEntry2`）。
-2. **ping 相機**。
+2. **ping 相機**：從所選網卡上與相機同網段的 IP 送出（等同 `ping -S`，Windows API `IcmpSendEcho2Ex`），不會經由別張網卡。2.0.1 以前用一般的 ping，由路由表決定從哪張網卡送出。
 3. **讀 CPU 使用率與主機板 ACPI 溫度**。
 4. **讀網卡晶片溫度與驅動內部重置計數**：AQtion WMI `Aq_DiagnosticsData`，需要系統管理員權限，約每 10 秒一次。
 5. **讀相機約 37 個暫存器**：用一個 GVCP 封包讀完，約 2～7 ms。暫存器位址是從相機的 GenICam XML 解析出來的。
@@ -80,7 +80,7 @@
 | 6 | `RxErrorDelta` | 封包數 | 接收錯誤增量（CRC 等）。正常應為 0 |
 | 7 | `TxDiscardDelta` | 封包數 | 傳送丟棄增量 |
 | 8 | `TxErrorDelta` | 封包數 | 傳送錯誤增量 |
-| 9 | `CameraPingMs` | ms 或 `Fail:<狀態>` | ping 相機的往返時間。失敗時為 `Fail:TimedOut`、`Fail:DestinationHostUnreachable` 等。沒設定相機 IP 時是空的 |
+| 9 | `CameraPingMs` | ms 或 `Fail:<狀態>` | ping 相機的往返時間（從相機網卡送出）。失敗時為 `Fail:TimedOut`、`Fail:DestinationHostUnreachable` 等；`Fail:NoSourceIp` = 所選網卡沒有 IPv4，這次沒有送 ping。沒設定相機 IP 時是空的 |
 | 10 | `CpuPercent` | % | 整台電腦 CPU 使用率。第一列是空的 |
 | 11 | `AcpiTempC` | °C | 主機板 ACPI 溫度區域中最高的值。讀不到時整欄為空，並有事件 90 |
 | 12 | `RxDiscardDeltaDiv2p32` | 數字 | 原始丟棄差值 ÷ 2³²，四捨五入到小數 2 位。NicMonitor 1.1.0 留下的欄位，約等於第 5 欄 |
@@ -178,7 +178,7 @@
 
 | EventId | Source | Level | 意義 | Message 中的資訊 |
 |---|---|---|---|---|
-| 1 | CamNetTool | 資訊 | 監控開始 | 網卡名稱、相機 IP、自動或手動、取樣間隔、版本 |
+| 1 | CamNetTool | 資訊 | 監控開始 | 網卡名稱、相機 IP、自動或手動、ping 從哪個 IP 送出（2.0.2 起）、取樣間隔、版本。例：`監控開始（網卡：小FOV，相機 IP：169.254.23.146（自動偵測，ping 從 169.254.192.4 送出），取樣間隔 10 秒，CamNetTool 2.0.2）` |
 | 2 | CamNetTool | 資訊 | 監控結束 | 原因、監控時長、各種次數統計、溫度最高值（見 5.4） |
 | 10 | CamNetTool | 警告 | 網卡連線中斷 | `Up → Disconnected` 等 |
 | 11 | CamNetTool | 資訊 | 網卡連線恢復 | 速度、中斷多久 |
@@ -186,6 +186,7 @@
 | 13 | CamNetTool | 警告（降速）/ 資訊（升速） | 連線速度改變 | 前後速度 |
 | 20 | CamNetTool | 警告 | 相機 ping 失敗 | IP、失敗狀態 |
 | 21 | CamNetTool | 資訊 | 相機 ping 恢復 | 延遲、中斷多久 |
+| 22 | CamNetTool | 資訊 | 相機 ping 來源改變 | 舊來源 IP → 新來源 IP（或「網卡沒有 IPv4」）、相機 IP。2.0.2 起 |
 | 30 | CamNetTool | 資訊 | 網卡計數器歸零（驅動重載） | |
 | 40 | CamNetTool | 警告 | 網卡驅動內部重置（rxPathReset / txPathReset / txWatchdog 增加） | 增加量與累計值 |
 | 50 | CamNetTool | 資訊 | 診斷快照開始 | 標籤 |
